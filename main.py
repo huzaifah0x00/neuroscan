@@ -1,95 +1,78 @@
-import re
-import os
-import tkinter as tk
-from tkinter import Label, Canvas
-from PIL import Image, ImageTk
-import json
-from pprint import pprint
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from tqdm import tqdm
+import argparse
 
+from data import trainset
 
-def natural_sort_key(s):
-    return [int(text) if text.isdigit() else text.lower() for text in re.split("([0-9]+)", s)]
+device = torch.device("cuda:0")
 
+class Net(nn.Module):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.base_layers = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2, 2),
+        )
+        self.flatten = nn.Flatten()
+        self.fc_layers = nn.Sequential(
+            nn.Linear(17408, 512),
+            nn.ReLU(),
+            nn.Linear(512, 4 + 4),
+        )
 
-image_dir = "dataset/images"
-label_dir = "dataset/labels"
+    def forward(self, x):
+        x = self.base_layers(x)
+        x = self.flatten(x)
+        x = self.fc_layers(x)
+        return x
 
+def compute_loss(predictions, targets):
+    predicted_boxes = predictions[:, :-4]
+    predicted_classes = predictions[:, -4:]
+    true_boxes = targets["box"].to(device)
+    true_classes = targets["class_label"].to(device)
+    loss_bbox = bbox_loss_function(predicted_boxes, true_boxes)
+    loss_class = class_loss_function(predicted_classes, true_classes)
+    total_loss = loss_bbox + loss_class
+    return total_loss
 
-image_files = sorted([f for f in os.listdir(image_dir) if f.endswith(".jpg")], key=natural_sort_key)
-label_files = sorted([f for f in os.listdir(label_dir) if f.endswith(".txt")], key=natural_sort_key)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Train or retrain the model.')
+    parser.add_argument('--retrain', action='store_true', help='Retrain the model from scratch')
+    args = parser.parse_args()
 
-print(f"total image files: {len(image_files)}")
-print(f"total label files: {len(label_files)}")
+    model = Net().to(device)
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
-pprint(image_files[0:10])
-pprint(label_files[0:10])
+    bbox_loss_function = torch.nn.SmoothL1Loss()
+    class_loss_function = torch.nn.CrossEntropyLoss()
 
-index = 0
+    if not args.retrain:
+        try:
+            model.load_state_dict(torch.load("trained_model_state_dict.pytorch"))
+            print("Model loaded successfully.")
+        except FileNotFoundError:
+            print("No saved model found. Training from scratch.")
 
+    EPOCHS = 5
+    for epoch in range(EPOCHS):
+        for data in tqdm(trainset):
+            X, y = data
+            X = X.to(device)
+            model.zero_grad()
+            outputs = model(X)
+            loss = compute_loss(outputs, y)
+            loss.backward()
+            optimizer.step()
+        print(loss)
 
-def load_image(index):
-    image_path = os.path.join(image_dir, image_files[index])
-    label_path = os.path.join(label_dir, label_files[index])
-
-    image = Image.open(image_path)
-    with open(label_path, "r") as f:
-        labels = [line.strip().split() for line in f]
-
-    return image, labels
-
-
-def display_image(canvas, image, labels):
-    canvas.delete("all")
-    img_width, img_height = image.size
-
-    scale_w = 250 / img_width
-    scale_h = 250 / img_height
-    scale = min(scale_w, scale_h)
-
-    new_width = int(img_width * scale)
-    new_height = int(img_height * scale)
-
-    image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
-    image_tk = ImageTk.PhotoImage(image)
-
-    x_offset = (250 - new_width) // 2
-    y_offset = (250 - new_height) // 2
-    canvas.create_image(x_offset, y_offset, anchor=tk.NW, image=image_tk)
-    canvas.image_tk = image_tk
-
-    for label in labels:
-        center_x, center_y, bbox_width, bbox_height = map(float, label[1:])
-        bbox_x = x_offset + (center_x - bbox_width / 2) * new_width
-        bbox_y = y_offset + (center_y - bbox_height / 2) * new_height
-        bbox_w = bbox_width * new_width
-        bbox_h = bbox_height * new_height
-        canvas.create_rectangle(bbox_x, bbox_y, bbox_x + bbox_w, bbox_y + bbox_h, outline="red", width=2)
-
-
-def show_next_image(event=None):
-    global index
-    index = (index + 1) % len(image_files)
-    image, labels = load_image(index)
-    print(f"Showing image: {image_files[index]}")
-    display_image(canvas, image, labels)
-
-
-def show_prev_image(event=None):
-    global index
-    index = (index - 1) % len(image_files)
-    image, labels = load_image(index)
-    display_image(canvas, image, labels)
-
-
-root = tk.Tk()
-root.title("Image Browser with Bounding Boxes")
-root.bind("<Right>", show_next_image)
-root.bind("<Left>", show_prev_image)
-
-canvas = Canvas(root, width=250, height=250)
-canvas.pack()
-
-image, labels = load_image(index)
-display_image(canvas, image, labels)
-
-root.mainloop()
+    torch.save(model.state_dict(), "trained_model_state_dict.pytorch")
